@@ -2,7 +2,6 @@
 
 A supply chain security CLI that collects SBOMs from GitHub repositories and searches them for compromised, malicious, or vulnerable package versions.
 
----
 
 ## Prerequisites
 
@@ -10,7 +9,6 @@ A supply chain security CLI that collects SBOMs from GitHub repositories and sea
 - [GitHub CLI](https://cli.github.com/) installed and authenticated (`gh auth login`)
 - Dependency graph enabled on target repos (Settings → Security & analysis → Dependency graph)
 
----
 
 ## Usage
 
@@ -49,7 +47,6 @@ pkg:npm/lodash@4.17.21
 pkg:pypi/requests@2.28.0
 ```
 
----
 
 ## Options
 
@@ -66,7 +63,6 @@ pkg:pypi/requests@2.28.0
 
 `--keep` and `--exclude` are mutually exclusive. `--search` and `--search-file` can be combined; duplicates are removed automatically.
 
----
 
 ## Output
 
@@ -97,7 +93,6 @@ A `_summary.json` audit log is always written, including search hits per term:
 }
 ```
 
----
 
 ## Incident Response
 
@@ -113,7 +108,6 @@ python chainwatch.py --org my-org --repos all \
 # 3. Review — affected repos are listed per term in stdout and _summary.json
 ```
 
----
 
 ## Limitations
 
