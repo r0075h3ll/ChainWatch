@@ -1,18 +1,18 @@
-# ChainWatch
+## ChainWatch
 
 A supply chain security CLI that scans every repository in a GitHub organization for compromised, malicious, or vulnerable package versions using the GitHub Dependency Graph SBOM API.
 
 Provide a CSV of known-bad packages and versions; ChainWatch walks every repo's SBOM (via `gh` CLI), performs ecosystem-aware matching, and surfaces any hits — with optional JSON and HTML reports.
 
 
-## Prerequisites
+### Prerequisites
 
 - Python 3.11+
 - [GitHub CLI](https://cli.github.com/) installed and authenticated (`gh auth login`)
 - Dependency graph enabled on target repos (Settings → Security & analysis → Dependency graph)
 
 
-## Usage
+### Usage
 
 ```bash
 # Basic scan — print findings to stdout
@@ -29,11 +29,11 @@ python chainwatch.py --csv compromised.csv --org MY_ORG --skip-archived --concur
 ```
 
 
-## CSV Format
+### CSV Format
 
 ChainWatch accepts two CSV formats. Both require an `Ecosystem` column.
 
-### Format A — Aggregated
+#### Format A — Aggregated
 
 ```
 Ecosystem,Package,Compromised Versions
@@ -42,7 +42,7 @@ pypi,requests,2.28.0
 maven,log4j-core,"2.14.0, 2.14.1"
 ```
 
-### Format B — Per-row (OSV / safedep export)
+#### Format B — Per-row
 
 ```
 Ecosystem,Namespace,Name,Version,Artifact,Published,Detected
@@ -55,7 +55,7 @@ In Format B, a non-empty `Namespace` is combined with `Name` as `namespace/name`
 Rows sharing the same `(ecosystem, name)` pair are merged; duplicate versions are deduplicated automatically. Rows missing `Ecosystem` are skipped with a warning.
 
 
-## Options
+### Options
 
 | Flag              | Default | Description                                                       |
 |-------------------|---------|-------------------------------------------------------------------|
@@ -67,7 +67,7 @@ Rows sharing the same `(ecosystem, name)` pair are merged; duplicate versions ar
 | `--concurrency`   | 5       | Parallel workers (1–10)                                           |
 
 
-## How It Works
+### How It Works
 
 1. **Load** the compromised packages CSV into an in-memory lookup keyed on `(ecosystem, package_name)`.
 2. **List** all repositories in the org via `gh repo list` (up to 10,000 repos; public and private).
@@ -78,9 +78,9 @@ Rows sharing the same `(ecosystem, name)` pair are merged; duplicate versions ar
 Repos without an SBOM (dependency graph disabled, no manifests) are silently skipped and counted separately.
 
 
-## Output
+### Output
 
-### Stdout
+#### Stdout
 
 ```
 --------------------------------------------------------------
@@ -101,7 +101,7 @@ my-org/data-pipeline         requests      2.28.0    pypi
 my-org/legacy-api            log4j-core    2.14.1    maven
 ```
 
-### JSON report (`--output`)
+#### JSON report (`--output`)
 
 ```json
 {
@@ -127,12 +127,12 @@ my-org/legacy-api            log4j-core    2.14.1    maven
 }
 ```
 
-### HTML report (`--html-report`)
+#### HTML report (`--html-report`)
 
 A self-contained dark-themed HTML file with a summary dashboard, a findings table (with repo links and PURLs), a per-ecosystem color-coded badge system, a scrollable scanned-repos list, and a remediation checklist. No external dependencies — open it in any browser.
 
 
-## Exit Codes
+### Exit Codes
 
 | Code | Meaning              |
 |------|----------------------|
@@ -142,7 +142,7 @@ A self-contained dark-themed HTML file with a summary dashboard, a findings tabl
 The non-zero exit on findings makes ChainWatch suitable for use as a CI gate.
 
 
-## Incident Response
+### Incident Response
 
 ```bash
 # 1. Build a watchlist CSV from known-bad packages
@@ -161,7 +161,7 @@ python chainwatch.py \
 ```
 
 
-## Limitations
+### Limitations
 
 - Matching is exact on version string. Semver ranges are not evaluated.
 - Only dependencies detected by GitHub's Dependency Graph are visible. Vendored code, non-standard manifests, and repos with the dependency graph disabled will not appear.
