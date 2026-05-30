@@ -1,510 +1,777 @@
 #!/usr/bin/env python3
 """
-Download dependency graph SBOMs for GitHub repositories using the `gh` CLI.
+ChainWatch
+----------
+Scans all repositories in a GitHub organization for specific compromised package
+versions using the GitHub Dependency Graph SBOM API (via `gh` CLI).
 
 Usage:
-    # Download SBOMs for specific repos:
-    python download_sbom.py --org my-org --repos repo1 repo2 repo3
-
-    # Download SBOMs for ALL repos in an org:
-    python download_sbom.py --org my-org --repos all
-
-    # Keep only npm and/or PyPI packages:
-    python download_sbom.py --org my-org --repos all --keep npm pypi
-
-    # Exclude npm and/or PyPI packages:
-    python download_sbom.py --org my-org --repos all --exclude npm pypi
-
-    # Search for a specific package across all repos (no files written):
-    python download_sbom.py --org my-org --repos all --search lodash@4.17.21
-    python download_sbom.py --org my-org --repos all --search "pkg:npm/lodash@4.17.21"
-    python download_sbom.py --org my-org --repos all --search lodash@4.17.21 requests@2.28.0
-
-    # Search using a text file of terms (one per line, # lines are comments):
-    python download_sbom.py --org my-org --repos all --search-file packages.txt
-
-    # Combine inline terms and a file:
-    python download_sbom.py --org my-org --repos all --search "pkg:npm/lodash@4.17.21" --search-file more.txt
-
-    # Specify a custom output directory:
-    python download_sbom.py --org my-org --repos all --output-dir ./sboms
-
-Prerequisites:
-    - `gh` CLI installed and authenticated (`gh auth login`)
-    - Sufficient permissions on the org/repos (read access + dependency graph enabled)
+    python3 chainwatch.py --csv compromised.csv --org MY_ORG
+    python3 chainwatch.py --csv compromised.csv --org MY_ORG --output report.json
+    python3 chainwatch.py --csv compromised.csv --org MY_ORG --html-report report.html
+    python3 chainwatch.py --csv compromised.csv --org MY_ORG --skip-archived --concurrency 8
 """
 
 import argparse
+import csv
+import html as html_module
 import json
 import subprocess
 import sys
 import time
-from datetime import datetime, UTC
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field, asdict
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import Optional
 
 
-# ─────────────────────────────────────────────
-# Ecosystem helpers
-# ─────────────────────────────────────────────
+# ── Data structures ────────────────────────────────────────────────────────────
 
-# Maps friendly CLI names → PURL namespace prefixes used in GitHub SBOMs.
-# e.g. "pkg:npm/lodash@4.17.21"  →  namespace = "npm"
-#      "pkg:pypi/requests@2.28.0" →  namespace = "pypi"
-ECOSYSTEM_ALIASES: dict[str, str] = {
-    "npm": "npm",
-    "pypi": "pypi",
-    "pip": "pypi",      # common alias
-    "python": "pypi",   # common alias
-}
-
-SUPPORTED_ECOSYSTEMS = sorted({v for v in ECOSYSTEM_ALIASES.values()})
+@dataclass
+class CompromisedPackage:
+    ecosystem: str       # e.g. "npm", "pypi", "maven"
+    name: str
+    versions: list[str]  # exact versions to match
 
 
-def resolve_ecosystems(names: list[str]) -> set[str]:
+@dataclass
+class Finding:
+    org: str
+    repo: str
+    package_name: str
+    matched_version: str
+    ecosystem: str
+    purl: str = ""
+
+
+@dataclass
+class ScanResult:
+    repos_scanned: int = 0
+    repos_skipped: int = 0          # no SBOM / dependency graph disabled
+    repos_errored: int = 0
+    findings: list[Finding] = field(default_factory=list)
+    skipped_repos: list[str] = field(default_factory=list)
+    scanned_repos: list[str] = field(default_factory=list)
+
+
+# ── CSV parsing ────────────────────────────────────────────────────────────────
+
+def load_compromised_csv(path: str) -> list[CompromisedPackage]:
     """
-    Convert user-supplied ecosystem names to canonical PURL namespaces.
-    Exits with a helpful message on unknown names.
+    Accepts two CSV formats. Ecosystem is required in both.
+
+    Format A — aggregated:
+      Ecosystem,Package,Compromised Versions
+      npm,timeago.js,"4.1.2, 4.2.2"
+      pypi,requests,2.28.0
+
+    Format B — per-row (OSV/safedep export):
+      Ecosystem,Namespace,Name,Version,Artifact,Published,Detected
+      npm,,timeago.js,4.2.2,...
+      npm,@openclaw-cn,feishu,0.2.11,...   → package name = @openclaw-cn/feishu
+
+    Rows with the same (ecosystem, name) are merged; duplicates are deduplicated.
+    Rows missing ecosystem or name are skipped with a warning.
     """
-    resolved: set[str] = set()
-    unknown: list[str] = []
-    for name in names:
-        canonical = ECOSYSTEM_ALIASES.get(name.lower())
-        if canonical:
-            resolved.add(canonical)
+    # key: (ecosystem_lower, name) → set of versions
+    packages: dict[tuple[str, str], set[str]] = {}
+    skipped = 0
+
+    with open(path, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        headers = reader.fieldnames or []
+
+        if "Name" in headers and "Version" in headers:
+            # Format B
+            for i, row in enumerate(reader, start=2):
+                ecosystem = row.get("Ecosystem", "").strip().lower()
+                namespace = row.get("Namespace", "").strip()
+                name = row.get("Name", "").strip()
+                version = row.get("Version", "").strip()
+                if not ecosystem:
+                    print(f"  ⚠️  Row {i}: missing Ecosystem — skipped", file=sys.stderr)
+                    skipped += 1
+                    continue
+                if not name or not version:
+                    continue
+                full_name = f"{namespace}/{name}" if namespace else name
+                packages.setdefault((ecosystem, full_name), set()).add(version)
         else:
-            unknown.append(name)
+            # Format A — requires Ecosystem column
+            if "Ecosystem" not in headers:
+                print(
+                    "ERROR: Format A CSV must have an 'Ecosystem' column.\n"
+                    "Expected header: Ecosystem,Package,Compromised Versions",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+            for i, row in enumerate(reader, start=2):
+                ecosystem = row.get("Ecosystem", "").strip().lower()
+                name = row.get("Package", "").strip().strip('"')
+                versions_raw = row.get("Compromised Versions", "").strip().strip('"')
+                if not ecosystem:
+                    print(f"  ⚠️  Row {i}: missing Ecosystem — skipped", file=sys.stderr)
+                    skipped += 1
+                    continue
+                if not name or not versions_raw:
+                    continue
+                for v in versions_raw.split(","):
+                    v = v.strip()
+                    if v:
+                        packages.setdefault((ecosystem, name), set()).add(v)
 
-    if unknown:
-        print(f"✗ Unknown ecosystem(s): {', '.join(unknown)}")
-        print(f"  Supported values: {', '.join(ECOSYSTEM_ALIASES)}")
-        sys.exit(1)
+    if skipped:
+        print(f"  ⚠️  {skipped} row(s) skipped due to missing ecosystem.", file=sys.stderr)
 
-    return resolved
-
-
-def purl_namespace(purl: str) -> str | None:
-    """
-    Extract the PURL type/namespace from a package URL string.
-    e.g. "pkg:npm/lodash@4.17.21" → "npm"
-    Returns None if the string is not a recognisable PURL.
-    """
-    if not purl or not purl.startswith("pkg:"):
-        return None
-    # pkg:<type>/...
-    rest = purl[4:]  # strip "pkg:"
-    return rest.split("/")[0].lower()
-
-
-def filter_packages(
-    packages: list[dict],
-    keep: set[str] | None,
-    exclude: set[str] | None,
-) -> tuple[list[dict], dict[str, int]]:
-    """
-    Apply --keep / --exclude filters to the list of SPDX packages.
-
-    - keep:    retain only packages whose PURL namespace is in this set.
-    - exclude: drop packages whose PURL namespace is in this set.
-    - If both are None, the original list is returned unchanged.
-
-    Also returns a breakdown dict of {namespace: count} for the kept packages.
-    """
-    if keep is None and exclude is None:
-        breakdown = {}
-        for pkg in packages:
-            for ref in pkg.get("externalRefs", []):
-                ns = purl_namespace(ref.get("referenceLocator", ""))
-                if ns:
-                    breakdown[ns] = breakdown.get(ns, 0) + 1
-                    break
-        return packages, breakdown
-
-    filtered: list[dict] = []
-    breakdown: dict[str, int] = {}
-
-    for pkg in packages:
-        # Find the PURL external reference (if any)
-        ns = None
-        for ref in pkg.get("externalRefs", []):
-            if ref.get("referenceType") == "purl":
-                ns = purl_namespace(ref.get("referenceLocator", ""))
-                break
-
-        # Packages without a PURL (e.g. the root "DESCRIBES" package) are
-        # always kept so the SBOM document structure stays valid.
-        if ns is None:
-            filtered.append(pkg)
-            continue
-
-        if keep is not None and ns not in keep:
-            continue
-        if exclude is not None and ns in exclude:
-            continue
-
-        filtered.append(pkg)
-        breakdown[ns] = breakdown.get(ns, 0) + 1
-
-    return filtered, breakdown
+    return [
+        CompromisedPackage(ecosystem=eco, name=n, versions=sorted(vs))
+        for (eco, n), vs in packages.items()
+    ]
 
 
-# ─────────────────────────────────────────────
-# GitHub / gh CLI helpers
-# ─────────────────────────────────────────────
+# ── GitHub helpers (via gh CLI) ────────────────────────────────────────────────
 
-def run_gh(args: list[str], check: bool = True) -> subprocess.CompletedProcess:
-    """Run a `gh` command and return the result."""
-    cmd = ["gh"] + args
-    return subprocess.run(cmd, capture_output=True, text=True, check=check)
-
-
-def check_gh_auth() -> None:
-    """Abort early if the user is not authenticated."""
-    result = run_gh(["auth", "status"], check=False)
-    if result.returncode != 0:
-        print("✗ Not authenticated with GitHub CLI.")
-        print("  Run: gh auth login")
+def run_gh(args: list[str], timeout: int = 30) -> tuple[bool, str, str]:
+    """Run a gh CLI command. Returns (success, stdout, stderr)."""
+    try:
+        result = subprocess.run(
+            ["gh"] + args,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        return result.returncode == 0, result.stdout, result.stderr
+    except subprocess.TimeoutExpired:
+        return False, "", "timeout"
+    except FileNotFoundError:
+        print("ERROR: `gh` CLI not found. Install from https://cli.github.com/", file=sys.stderr)
         sys.exit(1)
 
 
-def fetch_all_repos(org: str) -> list[str]:
-    """Return a list of all repository names (slug only) in *org*."""
-    print(f"→ Fetching repository list for org '{org}' …")
-
-    result = run_gh([
-        "api",
-        f"/orgs/{org}/repos",
-        "--paginate",
-        "--jq", ".[].name",
-    ], check=False)
-
-    if result.returncode != 0:
-        print(f"✗ Failed to list repositories for org '{org}':")
-        print(f"  {result.stderr.strip()}")
+def list_org_repos(org: str, skip_archived: bool = False) -> list[str]:
+    """
+    Returns a list of repo names (without org prefix) for the given org.
+    Uses `gh repo list` with --limit 10000 to handle large orgs.
+    Both public and private repos are included (requires appropriate token scope).
+    """
+    print(f"📋 Listing repositories for org: {org} ...")
+    args = [
+        "repo", "list", org,
+        "--limit", "10000",
+        "--json", "name,isArchived",
+    ]
+    ok, stdout, stderr = run_gh(args, timeout=120)
+    if not ok:
+        print(f"ERROR listing repos: {stderr}", file=sys.stderr)
         sys.exit(1)
 
-    repos = [n.strip() for n in result.stdout.splitlines() if n.strip()]
-    print(f"  Found {len(repos)} repositories.")
+    repos_data = json.loads(stdout)
+    repos = []
+    for r in repos_data:
+        if skip_archived and r.get("isArchived", False):
+            continue
+        repos.append(r["name"])
+
+    print(f"   Found {len(repos)} repositories.")
     return repos
 
 
-def search_packages(raw_json: str, terms: list[str]) -> dict[str, bool]:
+def fetch_sbom(org: str, repo: str) -> Optional[dict]:
     """
-    Do a plain substring search for each term in the raw SBOM JSON string.
-    Returns {term: found} for every term supplied.
-    """
-    return {term: term in raw_json for term in terms}
-
-
-RETRYABLE_ERRORS = ("timed out", "http 500", "http 502", "http 503", "http 504")
-MAX_RETRIES = 3
-RETRY_BACKOFF = [30, 60, 120]  # seconds between each retry attempt
-
-
-def download_sbom(
-    org: str,
-    repo: str,
-    output_dir: Path,
-    keep: "set[str] | None",
-    exclude: "set[str] | None",
-    search_terms: "list[str] | None" = None,
-) -> "tuple[bool, dict[str, bool]]":
-    """
-    Download the SBOM for *org*/*repo*, optionally filter packages, and save.
-    Retries up to MAX_RETRIES times on transient GitHub errors (timeout, 5xx).
-    Returns (success, {term: found}) — the hits dict is empty when not searching.
+    Fetch SPDX SBOM for a repo via GitHub REST API.
+    Returns parsed JSON dict or None if unavailable.
     """
     endpoint = f"/repos/{org}/{repo}/dependency-graph/sbom"
-    no_hits: dict[str, bool] = {t: False for t in (search_terms or [])}
-
-    result = None
-    for attempt in range(1, MAX_RETRIES + 1):
-        result = run_gh(["api", endpoint], check=False)
-        if result.returncode == 0:
-            break
-        stderr = result.stderr.strip()
-        is_retryable = any(e in stderr.lower() for e in RETRYABLE_ERRORS)
-        if is_retryable and attempt < MAX_RETRIES:
-            wait = RETRY_BACKOFF[attempt - 1]
-            print(f"  ⚠ {repo}: transient error (attempt {attempt}/{MAX_RETRIES}), retrying in {wait}s — {stderr}")
-            time.sleep(wait)
-        else:
-            break
-
-    if result.returncode != 0:
-        stderr = result.stderr.strip()
-        if "dependency graph is disabled" in stderr.lower():
-            reason = "dependency graph is disabled for this repo"
-        elif "not found" in stderr.lower() or "404" in stderr:
-            reason = "repo not found or no access"
-        elif "403" in stderr:
-            reason = "insufficient permissions"
-        elif any(e in stderr.lower() for e in RETRYABLE_ERRORS):
-            reason = f"timed out after {MAX_RETRIES} attempts — {stderr}"
-        else:
-            reason = stderr or "unknown error"
-        print(f"  ✗ {repo}: {reason}")
-        return False, no_hits
-
+    ok, stdout, stderr = run_gh(["api", endpoint], timeout=30)
+    if not ok:
+        # 404 = dependency graph not enabled or no manifest; silently skip
+        return None
     try:
-        data = json.loads(result.stdout)
-    except json.JSONDecodeError as exc:
-        print(f"  ✗ {repo}: invalid JSON response — {exc}")
-        return False, no_hits
+        return json.loads(stdout)
+    except json.JSONDecodeError:
+        return None
 
-    # ── Package search (substring match on raw JSON) ──
-    hits: dict[str, bool] = {}
-    if search_terms:
-        hits = search_packages(result.stdout, search_terms)
-        found = [t for t, ok in hits.items() if ok]
-        missing = [t for t, ok in hits.items() if not ok]
-        if found:
-            print(f"  ✓ found     → {', '.join(found)}")
-        if missing:
-            print(f"  ✗ not found → {', '.join(missing)}")
 
-    # ── Apply ecosystem filter ────────────────
-    sbom = data.get("sbom", data)  # GitHub wraps the SPDX doc under "sbom"
-    original_packages: list[dict] = sbom.get("packages", [])
-    filtered_packages, breakdown = filter_packages(original_packages, keep, exclude)
+# ── Core matching logic ────────────────────────────────────────────────────────
 
-    removed = len(original_packages) - len(filtered_packages)
-    if keep or exclude:
-        kept_total = sum(breakdown.values())
-        breakdown_str = ", ".join(f"{ns}={n}" for ns, n in sorted(breakdown.items()))
-        detail = f"{kept_total} kept ({breakdown_str}), {removed} removed"
-    else:
-        detail = f"{len(filtered_packages)} packages"
+def build_lookup(packages: list[CompromisedPackage]) -> dict[tuple[str, str], set[str]]:
+    """Build a fast lookup: (ecosystem_lower, name_lower) -> set of compromised versions."""
+    lookup: dict[tuple[str, str], set[str]] = {}
+    for pkg in packages:
+        key = (pkg.ecosystem.lower(), pkg.name.lower())
+        lookup.setdefault(key, set()).update(pkg.versions)
+    return lookup
 
-    # ── Build simplified output format ───────
-    purl_list: list[str] = []
-    for pkg in filtered_packages:
+
+def check_sbom(sbom_json: dict, lookup: dict[tuple[str, str], set[str]], org: str, repo: str) -> list[Finding]:
+    """
+    Walk the SBOM packages list and return any findings.
+    Matching is ecosystem-aware: a CSV entry for npm/lodash will NOT match pypi/lodash.
+    SBOM packages look like:
+      { "name": "lodash", "versionInfo": "4.17.20",
+        "externalRefs": [{"referenceLocator": "pkg:npm/lodash@4.17.20", ...}] }
+    """
+    findings = []
+    sbom = sbom_json.get("sbom", {})
+    packages = sbom.get("packages", [])
+
+    for pkg in packages:
+        name = pkg.get("name", "").strip()
+        version = pkg.get("versionInfo", "").strip()
+        if not name or not version:
+            continue
+
+        # Extract ecosystem from PURL before matching — required for ecosystem-aware lookup
+        purl = ""
+        ecosystem = ""
         for ref in pkg.get("externalRefs", []):
             if ref.get("referenceType") == "purl":
-                locator = ref.get("referenceLocator", "").strip()
-                if locator:
-                    purl_list.append(locator)
+                purl = ref.get("referenceLocator", "")
+                # purl format: pkg:ECOSYSTEM/[namespace/]name@version
+                if purl.startswith("pkg:"):
+                    ecosystem = purl[4:].split("/")[0].lower()
                 break
 
-    output = {
-        "repo_name": repo,
-        "packages": purl_list,
+        if not ecosystem:
+            continue  # can't determine ecosystem; skip to avoid false positives
+
+        compromised_versions = lookup.get((ecosystem, name.lower()))
+        if not compromised_versions:
+            continue
+
+        if version in compromised_versions:
+            findings.append(Finding(
+                org=org,
+                repo=f"{org}/{repo}",
+                package_name=name,
+                matched_version=version,
+                ecosystem=ecosystem,
+                purl=purl,
+            ))
+
+    return findings
+
+
+# ── Scan worker ────────────────────────────────────────────────────────────────
+
+def scan_repo(org: str, repo: str, lookup: dict[str, set[str]]) -> tuple[str, str, list[Finding]]:
+    """
+    Worker function: fetch SBOM for one repo and return findings.
+    Returns (repo, status, findings) where status is 'ok'|'skipped'|'error'.
+    """
+    sbom = fetch_sbom(org, repo)
+    if sbom is None:
+        return repo, "skipped", []
+
+    findings = check_sbom(sbom, lookup, org, repo)
+    return repo, "ok", findings
+
+
+# ── Output formatting ──────────────────────────────────────────────────────────
+
+def print_results(result: ScanResult, org: str):
+    total = result.repos_scanned + result.repos_skipped + result.repos_errored
+    print()
+    print("=" * 65)
+    print("           COMPROMISED PACKAGE SCAN REPORT")
+    print("=" * 65)
+    print(f"  Org         : {org}")
+    print(f"  Total repos : {total}")
+    print(f"  Scanned     : {result.repos_scanned}  |  Skipped (no SBOM): {result.repos_skipped}  |  Errors: {result.repos_errored}")
+    print(f"  Findings    : {len(result.findings)}")
+    print("=" * 65)
+
+    if not result.findings:
+        print("\n✅ No compromised packages found.")
+        return
+
+    print(f"\n🚨 HITS FOUND ({len(result.findings)}):\n")
+    col_repo  = max(len(f.repo) for f in result.findings) + 2
+    col_pkg   = max(len(f.package_name) for f in result.findings) + 2
+    col_ver   = max(len(f.matched_version) for f in result.findings) + 2
+    col_eco   = max(len(f.ecosystem) for f in result.findings) + 2
+
+    header = (
+        f"{'Repository':<{col_repo}} "
+        f"{'Package':<{col_pkg}} "
+        f"{'Version':<{col_ver}} "
+        f"{'Ecosystem':<{col_eco}}"
+    )
+    print(header)
+    print("-" * len(header))
+    for f in result.findings:
+        print(
+            f"{f.repo:<{col_repo}} "
+            f"{f.package_name:<{col_pkg}} "
+            f"{f.matched_version:<{col_ver}} "
+            f"{f.ecosystem:<{col_eco}}"
+        )
+    print()
+    print("⚠️  Remediation: Update affected packages immediately.")
+    print("   If packages are confirmed malware, report to Slack #ask-security.")
+
+
+def write_report(result: ScanResult, org: str, output_path: str):
+    report = {
+        "org": org,
+        "summary": {
+            "repos_scanned": result.repos_scanned,
+            "repos_skipped": result.repos_skipped,
+            "repos_errored": result.repos_errored,
+            "total_findings": len(result.findings),
+        },
+        "findings": [asdict(f) for f in result.findings],
+        "scanned_repos": sorted(result.scanned_repos),
+        "skipped_repos": sorted(result.skipped_repos),
     }
-
-    suffix = "_filtered" if (keep or exclude) else ""
-    out_file = output_dir / f"{repo}_sbom{suffix}.json"
-    out_file.write_text(json.dumps(output, indent=2), encoding="utf-8")
-    print(f"  ✓ {repo} → {out_file}  [{detail}]")
-    return True, hits
+    with open(output_path, "w", encoding="utf-8") as fh:
+        json.dump(report, fh, indent=2)
+    print(f"\n📄 Full report written to: {output_path}")
 
 
-# ─────────────────────────────────────────────
-# Main
-# ─────────────────────────────────────────────
+# ── HTML Report ───────────────────────────────────────────────────────────────
 
-def main() -> None:
+def write_html_report(result: ScanResult, org: str, packages: list[CompromisedPackage], output_path: str):
+    """Generate a self-contained HTML security report."""
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    total_repos = result.repos_scanned + result.repos_skipped + result.repos_errored
+    num_findings = len(result.findings)
+    severity_class = "critical" if num_findings > 0 else "clean"
+    severity_label = f"🚨 {num_findings} FINDING{'S' if num_findings != 1 else ''} — IMMEDIATE ACTION REQUIRED" if num_findings > 0 else "✅ No Compromised Packages Found"
+
+    # Build findings rows
+    findings_rows = ""
+    if result.findings:
+        for f in result.findings:
+            repo_url = f"https://github.com/{f.repo}"
+            purl_cell = f'<code class="purl">{html_module.escape(f.purl)}</code>' if f.purl else "—"
+            findings_rows += f"""
+            <tr>
+              <td><a href="{html_module.escape(repo_url)}" target="_blank">{html_module.escape(f.repo)}</a></td>
+              <td><span class="pkg-name">{html_module.escape(f.package_name)}</span></td>
+              <td><span class="version-badge">{html_module.escape(f.matched_version)}</span></td>
+              <td><span class="eco-badge eco-{html_module.escape(f.ecosystem)}">{html_module.escape(f.ecosystem)}</span></td>
+              <td>{purl_cell}</td>
+            </tr>"""
+    else:
+        findings_rows = '<tr><td colspan="5" class="no-findings">No compromised packages detected.</td></tr>'
+
+    # Build scanned repos table rows
+    scanned_repos_rows = "".join(
+        f'<tr><td><a href="https://github.com/{html_module.escape(org)}/{html_module.escape(r)}" target="_blank">'
+        f'{html_module.escape(r)}</a></td></tr>'
+        for r in sorted(result.scanned_repos)
+    ) or '<tr><td class="no-findings">No repositories were scanned.</td></tr>'
+
+    # Build scanned packages list
+    pkg_list_items = "".join(
+        f'<li>'
+        f'<span class="eco-badge eco-{html_module.escape(p.ecosystem)}">{html_module.escape(p.ecosystem)}</span> '
+        f'<code>{html_module.escape(p.name)}</code> — '
+        f'{", ".join(f"<span class=\'version-badge\'>{html_module.escape(v)}</span>" for v in p.versions)}'
+        f'</li>'
+        for p in packages
+    )
+
+    # Group findings by repo for the summary sidebar
+    repos_hit = sorted({f.repo for f in result.findings})
+    repos_hit_html = "".join(
+        f'<li><a href="https://github.com/{html_module.escape(r)}" target="_blank">{html_module.escape(r)}</a></li>'
+        for r in repos_hit
+    ) or "<li>None</li>"
+
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Security Scan Report — {html_module.escape(org)}</title>
+  <style>
+    *, *::before, *::after {{ box-sizing: border-box; margin: 0; padding: 0; }}
+
+    body {{
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: #0d1117;
+      color: #c9d1d9;
+      min-height: 100vh;
+    }}
+
+    /* ── Header ── */
+    .header {{
+      background: linear-gradient(135deg, #161b22 0%, #0d1117 100%);
+      border-bottom: 1px solid #30363d;
+      padding: 2rem 2.5rem;
+      display: flex;
+      align-items: center;
+      gap: 1.5rem;
+    }}
+    .header-icon {{ font-size: 2.5rem; }}
+    .header-title {{ font-size: 1.5rem; font-weight: 700; color: #f0f6fc; }}
+    .header-sub {{ font-size: 0.875rem; color: #8b949e; margin-top: 0.2rem; }}
+
+    /* ── Banner ── */
+    .banner {{
+      padding: 1rem 2.5rem;
+      font-weight: 600;
+      font-size: 1rem;
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+    }}
+    .banner.critical {{ background: #3d1a1a; border-left: 4px solid #f85149; color: #ffa198; }}
+    .banner.clean    {{ background: #0f2d1c; border-left: 4px solid #3fb950; color: #56d364; }}
+
+    /* ── Layout ── */
+    .container {{ max-width: 1280px; margin: 0 auto; padding: 2rem 2.5rem; }}
+    .grid {{ display: grid; grid-template-columns: 1fr 300px; gap: 1.5rem; align-items: start; }}
+    @media (max-width: 900px) {{ .grid {{ grid-template-columns: 1fr; }} }}
+
+    /* ── Cards ── */
+    .card {{
+      background: #161b22;
+      border: 1px solid #30363d;
+      border-radius: 8px;
+      overflow: hidden;
+      margin-bottom: 1.5rem;
+    }}
+    .card-header {{
+      background: #1c2128;
+      padding: 0.85rem 1.25rem;
+      font-weight: 600;
+      font-size: 0.9rem;
+      color: #f0f6fc;
+      border-bottom: 1px solid #30363d;
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+    }}
+    .card-body {{ padding: 1.25rem; }}
+
+    /* ── Stat boxes ── */
+    .stats {{ display: grid; grid-template-columns: repeat(4, 1fr); gap: 1rem; margin-bottom: 1.5rem; }}
+    @media (max-width: 700px) {{ .stats {{ grid-template-columns: repeat(2, 1fr); }} }}
+    .stat {{
+      background: #161b22;
+      border: 1px solid #30363d;
+      border-radius: 8px;
+      padding: 1rem 1.25rem;
+      text-align: center;
+    }}
+    .stat-value {{ font-size: 2rem; font-weight: 700; color: #f0f6fc; }}
+    .stat-value.danger {{ color: #f85149; }}
+    .stat-value.ok     {{ color: #3fb950; }}
+    .stat-label {{ font-size: 0.75rem; color: #8b949e; margin-top: 0.25rem; text-transform: uppercase; letter-spacing: 0.05em; }}
+
+    /* ── Table ── */
+    .table-wrap {{ overflow-x: auto; }}
+    table {{ width: 100%; border-collapse: collapse; font-size: 0.875rem; }}
+    th {{
+      background: #1c2128;
+      color: #8b949e;
+      font-weight: 600;
+      font-size: 0.75rem;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      padding: 0.65rem 1rem;
+      text-align: left;
+      border-bottom: 1px solid #30363d;
+    }}
+    td {{ padding: 0.75rem 1rem; border-bottom: 1px solid #21262d; vertical-align: middle; }}
+    tr:last-child td {{ border-bottom: none; }}
+    tr:hover td {{ background: #1c2128; }}
+    a {{ color: #58a6ff; text-decoration: none; }}
+    a:hover {{ text-decoration: underline; }}
+
+    /* ── Badges ── */
+    .version-badge {{
+      background: #3d1a1a;
+      color: #ffa198;
+      border: 1px solid #6e2020;
+      border-radius: 4px;
+      padding: 0.15rem 0.5rem;
+      font-size: 0.8rem;
+      font-family: monospace;
+      white-space: nowrap;
+    }}
+    .pkg-name {{ font-family: monospace; color: #e3b341; font-weight: 600; }}
+    .eco-badge {{
+      border-radius: 12px;
+      padding: 0.15rem 0.6rem;
+      font-size: 0.75rem;
+      font-weight: 600;
+      background: #1f3347;
+      color: #58a6ff;
+      border: 1px solid #1f6feb;
+    }}
+    .eco-badge.eco-npm    {{ background: #1e2d1e; color: #3fb950; border-color: #238636; }}
+    .eco-badge.eco-pypi   {{ background: #2d2416; color: #e3b341; border-color: #9e6a03; }}
+    .eco-badge.eco-rubygems {{ background: #3d1a1a; color: #ffa198; border-color: #6e2020; }}
+    .eco-badge.eco-maven  {{ background: #1a1f3d; color: #a5d6ff; border-color: #1f6feb; }}
+    .eco-badge.eco-unknown {{ background: #21262d; color: #8b949e; border-color: #30363d; }}
+
+    .purl {{ font-size: 0.75rem; color: #8b949e; word-break: break-all; }}
+    .no-findings {{ text-align: center; padding: 2rem; color: #56d364; font-weight: 600; }}
+
+    /* ── Sidebar ── */
+    .sidebar .card {{ margin-bottom: 1rem; }}
+    .sidebar ul {{ list-style: none; padding: 0; }}
+    .sidebar li {{ padding: 0.4rem 0; border-bottom: 1px solid #21262d; font-size: 0.85rem; }}
+    .sidebar li:last-child {{ border-bottom: none; }}
+    .sidebar code {{
+      background: #21262d;
+      border-radius: 3px;
+      padding: 0.1rem 0.35rem;
+      font-size: 0.8rem;
+      color: #e3b341;
+    }}
+    .sidebar .version-badge {{ font-size: 0.72rem; }}
+
+    /* ── Scrollable repo list ── */
+    .repo-table-wrap {{
+      max-height: 400px;
+      overflow-y: auto;
+      border-radius: 0 0 8px 8px;
+    }}
+    .repo-table-wrap table {{ font-size: 0.85rem; }}
+    .repo-table-wrap td {{ padding: 0.5rem 1rem; }}
+
+    /* ── Footer ── */
+    .footer {{
+      text-align: center;
+      color: #484f58;
+      font-size: 0.8rem;
+      padding: 2rem;
+      border-top: 1px solid #21262d;
+      margin-top: 2rem;
+    }}
+
+    /* ── Remediation box ── */
+    .remediation {{
+      background: #2d1f00;
+      border: 1px solid #9e6a03;
+      border-radius: 8px;
+      padding: 1rem 1.25rem;
+      margin-top: 1.5rem;
+      font-size: 0.875rem;
+      color: #e3b341;
+    }}
+    .remediation strong {{ color: #f0f6fc; }}
+    .remediation ul {{ margin-top: 0.5rem; padding-left: 1.25rem; line-height: 1.8; }}
+  </style>
+</head>
+<body>
+
+<div class="header">
+  <div class="header-icon">🔐</div>
+  <div>
+    <div class="header-title">Security Scan Report — {html_module.escape(org)}</div>
+    <div class="header-sub">GitHub Dependency Graph · Compromised Package Audit · Generated {ts}</div>
+  </div>
+</div>
+
+<div class="banner {severity_class}">{severity_label}</div>
+
+<div class="container">
+
+  <!-- Stats row -->
+  <div class="stats">
+    <div class="stat">
+      <div class="stat-value">{total_repos}</div>
+      <div class="stat-label">Repos Processed</div>
+    </div>
+    <div class="stat">
+      <div class="stat-value">{result.repos_scanned}</div>
+      <div class="stat-label">Repos Scanned</div>
+    </div>
+    <div class="stat">
+      <div class="stat-value">{len(packages)}</div>
+      <div class="stat-label">Packages Checked</div>
+    </div>
+    <div class="stat">
+      <div class="stat-value {'danger' if num_findings > 0 else 'ok'}">{num_findings}</div>
+      <div class="stat-label">Findings</div>
+    </div>
+  </div>
+
+  <div class="grid">
+    <!-- Main content -->
+    <div class="main">
+      <div class="card">
+        <div class="card-header">⚠️ Findings</div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Repository</th>
+                <th>Package</th>
+                <th>Version</th>
+                <th>Ecosystem</th>
+                <th>PURL</th>
+              </tr>
+            </thead>
+            <tbody>{findings_rows}</tbody>
+          </table>
+        </div>
+      </div>
+
+      {"" if num_findings == 0 else '''
+      <div class="remediation">
+        <strong>⚡ Recommended Actions</strong>
+        <ul>
+          <li>Update or remove each affected package immediately.</li>
+          <li>Audit <code>package-lock.json</code> / <code>yarn.lock</code> / <code>requirements.txt</code> in impacted repos.</li>
+          <li>If packages are confirmed malware, report to Slack <code>#ask-security</code> right away.</li>
+          <li>Consider adding these package names to your dependency review policy to block future installs.</li>
+        </ul>
+      </div>
+      '''}
+
+      <div class="card">
+        <div class="card-header">✅ Scanned Repositories ({result.repos_scanned})</div>
+        <div class="repo-table-wrap">
+          <table>
+            <thead><tr><th>Repository</th></tr></thead>
+            <tbody>{scanned_repos_rows}</tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <!-- Sidebar -->
+    <div class="sidebar">
+      <div class="card">
+        <div class="card-header">📊 Scan Summary</div>
+        <div class="card-body">
+          <ul>
+            <li>Org: <strong>{html_module.escape(org)}</strong></li>
+            <li>Total repos: <strong>{total_repos}</strong></li>
+            <li>Scanned: <strong>{result.repos_scanned}</strong></li>
+            <li>Skipped (no SBOM): <strong>{result.repos_skipped}</strong></li>
+            <li>Errors: <strong>{result.repos_errored}</strong></li>
+            <li>Repos with hits: <strong>{len(repos_hit)}</strong></li>
+          </ul>
+        </div>
+      </div>
+
+      {"" if num_findings == 0 else f"""
+      <div class="card">
+        <div class="card-header">🎯 Affected Repos</div>
+        <div class="card-body">
+          <ul>{repos_hit_html}</ul>
+        </div>
+      </div>
+      """}
+
+      <div class="card">
+        <div class="card-header">🔍 Packages Audited</div>
+        <div class="card-body">
+          <ul>{pkg_list_items}</ul>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="footer">
+  Generated by ChainWatch · {ts} · GitHub Dependency Graph SBOM API
+</div>
+
+</body>
+</html>"""
+
+    with open(output_path, "w", encoding="utf-8") as fh:
+        fh.write(html)
+    print(f"\n🌐 HTML report written to: {output_path}")
+
+
+# ── Main ───────────────────────────────────────────────────────────────────────
+
+def main():
     parser = argparse.ArgumentParser(
-        description="Download GitHub dependency-graph SBOMs via the gh CLI.",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=__doc__,
+        description="Scan a GitHub org's repos for compromised package versions."
     )
-    parser.add_argument(
-        "--org", "-o",
-        required=True,
-        help="GitHub organisation name (e.g. my-org)",
-    )
-    parser.add_argument(
-        "--repos", "-r",
-        nargs="+",
-        required=True,
-        metavar="REPO",
-        help="One or more repo names, or the special value 'all'",
-    )
-    parser.add_argument(
-        "--output-dir", "-d",
-        default="./sboms",
-        help="Directory to write SBOM files into (default: ./sboms)",
-    )
-    parser.add_argument(
-        "--delay",
-        type=float,
-        default=15.0,
-        metavar="SECONDS",
-        help=(
-            "Seconds to wait between API calls when processing more than 5 repos "
-            "(default: 15). Use --delay to set a custom value, e.g. --delay 30."
-        ),
-    )
-
-    # Mutually exclusive ecosystem filters
-    filter_group = parser.add_mutually_exclusive_group()
-    filter_group.add_argument(
-        "--keep",
-        nargs="+",
-        metavar="ECOSYSTEM",
-        help=(
-            "Keep ONLY packages from these ecosystems. "
-            f"Supported: {', '.join(ECOSYSTEM_ALIASES)}. "
-            "Example: --keep npm pypi"
-        ),
-    )
-    filter_group.add_argument(
-        "--exclude",
-        nargs="+",
-        metavar="ECOSYSTEM",
-        help=(
-            "Exclude packages from these ecosystems. "
-            f"Supported: {', '.join(ECOSYSTEM_ALIASES)}. "
-            "Example: --exclude npm"
-        ),
-    )
-
-    parser.add_argument(
-        "--search", "-s",
-        nargs="+",
-        metavar="PKG",
-        help=(
-            "Search for one or more package substrings across all fetched SBOMs. "
-            "Accepts 'name@version' (e.g. lodash@4.17.21) or full PURL "
-            "(e.g. pkg:npm/lodash@4.17.21). Multiple terms are space-separated. "
-            "Can be combined with --search-file."
-        ),
-    )
-    parser.add_argument(
-        "--search-file", "-S",
-        metavar="FILE",
-        help=(
-            "Path to a plain-text file with one search term per line. "
-            "Each term can be 'name@version' or a full PURL (pkg:npm/lodash@4.17.21). "
-            "Blank lines and lines starting with '#' are ignored. "
-            "Can be combined with --search."
-        ),
-    )
-
+    parser.add_argument("--csv", required=True, help="Path to CSV file (Package, Compromised Versions)")
+    parser.add_argument("--org", required=True, help="GitHub organization slug")
+    parser.add_argument("--output", default="", help="Optional: write JSON report to this file")
+    parser.add_argument("--html-report", default="", metavar="FILE", help="Optional: write HTML security report to this file")
+    parser.add_argument("--skip-archived", action="store_true", help="Skip archived repositories")
+    parser.add_argument("--concurrency", type=int, default=5, help="Parallel workers (default: 5, max: 10)")
     args = parser.parse_args()
 
-    # ── Resolve ecosystem filters ─────────────
-    keep_ecosystems: set[str] | None = None
-    exclude_ecosystems: set[str] | None = None
+    # Validate inputs
+    if not Path(args.csv).exists():
+        print(f"ERROR: CSV file not found: {args.csv}", file=sys.stderr)
+        sys.exit(1)
 
-    if args.keep:
-        keep_ecosystems = resolve_ecosystems(args.keep)
-        print(f"→ Keeping only ecosystems: {', '.join(sorted(keep_ecosystems))}")
-    elif args.exclude:
-        exclude_ecosystems = resolve_ecosystems(args.exclude)
-        print(f"→ Excluding ecosystems: {', '.join(sorted(exclude_ecosystems))}")
+    concurrency = max(1, min(args.concurrency, 10))
 
-    # ── Resolve search terms (inline + file) ──
-    raw_terms: list[str] = list(args.search or [])
+    # Load compromised packages
+    packages = load_compromised_csv(args.csv)
+    if not packages:
+        print("ERROR: No packages loaded from CSV.", file=sys.stderr)
+        sys.exit(1)
+    print(f"🔍 Loaded {len(packages)} compromised package(s) from {args.csv}")
+    for p in packages:
+        print(f"   - [{p.ecosystem}] {p.name}: {', '.join(p.versions)}")
 
-    if args.search_file:
-        search_file_path = Path(args.search_file)
-        if not search_file_path.is_file():
-            print(f"✗ --search-file: file not found: {search_file_path}")
-            sys.exit(1)
-        lines = search_file_path.read_text(encoding="utf-8").splitlines()
-        file_terms = [
-            ln.strip()
-            for ln in lines
-            if ln.strip() and not ln.strip().startswith("#")
-        ]
-        if not file_terms:
-            print(f"✗ --search-file: no valid search terms found in {search_file_path}")
-            sys.exit(1)
-        raw_terms.extend(file_terms)
-        print(f"→ Loaded {len(file_terms)} term(s) from {search_file_path}")
+    lookup = build_lookup(packages)
 
-    # Deduplicate while preserving order
-    seen: set[str] = set()
-    search_terms: list[str] | None = None
-    if raw_terms:
-        deduped = []
-        for t in raw_terms:
-            if t not in seen:
-                seen.add(t)
-                deduped.append(t)
-        search_terms = deduped
-        print(f"→ Searching for {len(search_terms)} unique term(s): {', '.join(search_terms)}")
-
-    # ── Preflight ────────────────────────────
-    check_gh_auth()
-
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    # ── Resolve repository list ───────────────
-    if len(args.repos) == 1 and args.repos[0].lower() == "all":
-        repos = fetch_all_repos(args.org)
-    else:
-        repos = args.repos
-
+    # List all org repos
+    repos = list_org_repos(args.org, skip_archived=args.skip_archived)
     if not repos:
-        print("No repositories to process. Exiting.")
+        print("No repositories found. Check org name and token permissions.")
         sys.exit(0)
 
-    # ── Download SBOMs ────────────────────────
-    print(f"\nDownloading SBOMs for {len(repos)} repo(s) into '{output_dir}/' …\n")
-    start = datetime.now()
+    # Scan repos in parallel
+    result = ScanResult()
+    total = len(repos)
+    done = 0
 
-    succeeded, failed = [], []
-    # {term: [repo, repo, ...]} — repos where the term was found
-    search_hits: dict[str, list[str]] = {t: [] for t in (search_terms or [])}
+    print(f"\n🔎 Scanning {total} repos with {concurrency} workers ...\n")
 
-    apply_delay = len(repos) > 5
-    if apply_delay:
-        print(f"  (rate-limit delay: {args.delay}s between requests — default 15s, override with --delay)\n")
+    with ThreadPoolExecutor(max_workers=concurrency) as executor:
+        futures = {
+            executor.submit(scan_repo, args.org, repo, lookup): repo
+            for repo in repos
+        }
+        for future in as_completed(futures):
+            repo_name, status, findings = future.result()
+            done += 1
+            bar_done = int(40 * done / total)
+            bar = "█" * bar_done + "░" * (40 - bar_done)
+            status_icon = {"ok": "✓", "skipped": "–", "error": "✗"}.get(status, "?")
+            print(f"\r  [{bar}] {done}/{total} {status_icon} {repo_name[:40]:<40}", end="", flush=True)
 
-    for i, repo in enumerate(repos, 1):
-        print(f"[{i}/{len(repos)}] {repo}")
-        ok, hits = download_sbom(args.org, repo, output_dir, keep_ecosystems, exclude_ecosystems, search_terms)
-        (succeeded if ok else failed).append(repo)
-        for term, found in hits.items():
-            if found:
-                search_hits[term].append(repo)
-
-        if apply_delay and i < len(repos):
-            time.sleep(args.delay)
-
-    # ── Summary ───────────────────────────────
-    elapsed = (datetime.now() - start).total_seconds()
-    print(f"\n{'─' * 50}")
-    print(f"Done in {elapsed:.1f}s — {len(succeeded)} succeeded, {len(failed)} failed.")
-
-    if failed:
-        print("\nFailed repositories:")
-        for repo in failed:
-            print(f"  • {repo}")
-
-    if search_terms:
-        print("\nSearch results:")
-        for term in search_terms:
-            matches = search_hits[term]
-            if matches:
-                print(f"  '{term}' found in {len(matches)} repo(s):")
-                for r in matches:
-                    print(f"      • {r}")
+            if status == "ok":
+                result.repos_scanned += 1
+                result.findings.extend(findings)
+                result.scanned_repos.append(repo_name)
+            elif status == "skipped":
+                result.repos_skipped += 1
+                result.skipped_repos.append(repo_name)
             else:
-                print(f"  '{term}' — not found in any repo")
+                result.repos_errored += 1
 
-    summary = {
-        "org": args.org,
-        "timestamp": datetime.now(UTC).isoformat(),
-        "total": len(repos),
-        "filter": {
-            "mode": "keep" if keep_ecosystems else ("exclude" if exclude_ecosystems else "none"),
-            "ecosystems": sorted(keep_ecosystems or exclude_ecosystems or []),
-        },
-        "search": {
-            "terms": search_terms or [],
-            "hits": {term: search_hits[term] for term in (search_terms or [])},
-        },
-        "succeeded": succeeded,
-        "failed": failed,
-    }
-    summary_file = output_dir / "_summary.json"
-    summary_file.write_text(json.dumps(summary, indent=2), encoding="utf-8")
-    print(f"\nSummary written to {summary_file}")
+            # Gentle rate-limit throttle: pause briefly every 50 repos
+            if done % 50 == 0:
+                time.sleep(1)
 
-    sys.exit(0 if not failed else 1)
+    print()  # newline after progress bar
+
+    # Print results
+    print_results(result, args.org)
+
+    # Write JSON report if requested
+    if args.output:
+        write_report(result, args.org, args.output)
+
+    # Write HTML report if requested
+    if args.html_report:
+        write_html_report(result, args.org, packages, args.html_report)
+
+    # Exit code: 1 if findings, 0 if clean (useful for CI)
+    sys.exit(1 if result.findings else 0)
 
 
 if __name__ == "__main__":
