@@ -4,7 +4,6 @@ A supply chain security CLI that scans every repository in a GitHub organization
 
 Provide a CSV of known-bad packages and versions; ChainWatch walks every repo's SBOM (via `gh` CLI), performs ecosystem-aware matching, and surfaces any hits — with optional JSON and HTML reports.
 
----
 
 ## Prerequisites
 
@@ -12,7 +11,6 @@ Provide a CSV of known-bad packages and versions; ChainWatch walks every repo's 
 - [GitHub CLI](https://cli.github.com/) installed and authenticated (`gh auth login`)
 - Dependency graph enabled on target repos (Settings → Security & analysis → Dependency graph)
 
----
 
 ## Usage
 
@@ -30,7 +28,6 @@ python chainwatch.py --csv compromised.csv --org MY_ORG --html-report report.htm
 python chainwatch.py --csv compromised.csv --org MY_ORG --skip-archived --concurrency 8
 ```
 
----
 
 ## CSV Format
 
@@ -57,7 +54,6 @@ In Format B, a non-empty `Namespace` is combined with `Name` as `namespace/name`
 
 Rows sharing the same `(ecosystem, name)` pair are merged; duplicate versions are deduplicated automatically. Rows missing `Ecosystem` are skipped with a warning.
 
----
 
 ## Options
 
@@ -70,7 +66,6 @@ Rows sharing the same `(ecosystem, name)` pair are merged; duplicate versions ar
 | `--skip-archived` | false   | Skip archived repositories                                        |
 | `--concurrency`   | 5       | Parallel workers (1–10)                                           |
 
----
 
 ## How It Works
 
@@ -82,21 +77,20 @@ Rows sharing the same `(ecosystem, name)` pair are merged; duplicate versions ar
 
 Repos without an SBOM (dependency graph disabled, no manifests) are silently skipped and counted separately.
 
----
 
 ## Output
 
 ### Stdout
 
 ```
-=================================================================
+--------------------------------------------------------------
            COMPROMISED PACKAGE SCAN REPORT
-=================================================================
+--------------------------------------------------------------
   Org         : my-org
   Total repos : 120
   Scanned     : 98  |  Skipped (no SBOM): 22  |  Errors: 0
   Findings    : 3
-=================================================================
+--------------------------------------------------------------
 
 🚨 HITS FOUND (3):
 
@@ -137,7 +131,6 @@ my-org/legacy-api            log4j-core    2.14.1    maven
 
 A self-contained dark-themed HTML file with a summary dashboard, a findings table (with repo links and PURLs), a per-ecosystem color-coded badge system, a scrollable scanned-repos list, and a remediation checklist. No external dependencies — open it in any browser.
 
----
 
 ## Exit Codes
 
@@ -148,7 +141,6 @@ A self-contained dark-themed HTML file with a summary dashboard, a findings tabl
 
 The non-zero exit on findings makes ChainWatch suitable for use as a CI gate.
 
----
 
 ## Incident Response
 
@@ -168,7 +160,6 @@ python chainwatch.py \
 #    If malware is confirmed, report to Slack #ask-security
 ```
 
----
 
 ## Limitations
 
